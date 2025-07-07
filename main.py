@@ -10,14 +10,17 @@ from dataclasses import dataclass
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from cuid2 import cuid_wrapper
-from picamera2 import Picamera2
 import time
 from dotenv import load_dotenv
-import psycopg2
 from psycopg2 import pool
 
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+try:
+    from picamera2 import Picamera2  # type: ignore
+except ImportError:
+    Picamera2 = None
 
+# fix bug that keeps webcam open
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 
 # Define the counting line in normalized coordinates (0-1)
 # (x1, y1), (x2, y2) where x and y are between 0 and 1
@@ -65,6 +68,7 @@ BoundingBox = Tuple[float, float, float, float]  # (x1, y1, x2, y2)
 
 # Global state variables
 db_conn: Optional[sqlite3.Connection] = None
+connection_pool: Optional[pool.SimpleConnectionPool] = None
 track_states: TrackStates = {}
 counts: Counts = Counts()
 tracks: Tracks = []
@@ -76,7 +80,6 @@ left_is_in: bool = True
 def init_neon_connection_pool() -> None:
     """Initialize the Neon connection pool"""
     load_dotenv()
-
     connection_string = os.getenv('DATABASE_URL')
 
     try:
@@ -329,22 +332,21 @@ def main() -> None:
     
 
     try:
-        #cap = cv2.VideoCapture(0 if args.video is None else args.video)
         if args.input == 'picamera':
-            picam2 = Picamera2()
-            config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
-            picam2.configure(config)
-            picam2.start()
+            if Picamera2 is None:
+                print("picamera2 not available, exiting")
+                return
+            else:
+                picam2 = Picamera2()  # type: ignore
+                config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
+                picam2.configure(config)
+                picam2.start()
         elif args.input == 'video':
             cap = cv2.VideoCapture(args.video)
         else:
             cap = cv2.VideoCapture(0)
 
         model = YOLO('yolov8n.pt', verbose=False)  # Use YOLOv8 nano model for speed
-        frame_count = 0
-        MAX_FRAMES_TO_SAVE = 0
-        saved_frames = 0
-
 
         while True:
             if args.input == 'picamera':
@@ -354,14 +356,16 @@ def main() -> None:
                 if not ret:
                     break
 
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            assert frame is not None, "No frame from source"
+
+            if args.input == 'picamera':
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             # Mirror the webcam horizontally
             frame = cv2.flip(frame, 1)
 
             # Convert normalized line coordinates to pixel coordinates
-            if frame is not None:
-                frame_height, frame_width = frame.shape[:2]
+            frame_height, frame_width = frame.shape[:2]
             line = (
                 normalized_to_pixel(LINE_NORMALIZED[0], frame_width, frame_height),
                 normalized_to_pixel(LINE_NORMALIZED[1], frame_width, frame_height)

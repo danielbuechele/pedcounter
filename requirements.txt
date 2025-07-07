@@ -4,3 +4,5 @@ ultralytics>=8.1.0
 opencv-python
 numpy
 cuid2
+psycopg2
+python-dotenv
