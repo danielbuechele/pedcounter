@@ -10,6 +10,14 @@ from dataclasses import dataclass
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from cuid2 import cuid_wrapper
+from picamera2 import Picamera2
+import time
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2 import pool
+
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+
 
 # Define the counting line in normalized coordinates (0-1)
 # (x1, y1), (x2, y2) where x and y are between 0 and 1
@@ -65,6 +73,56 @@ frame: Optional[np.ndarray] = None
 results: Optional[List[Results]] = None
 left_is_in: bool = True
 
+def init_neon_connection_pool() -> None:
+    """Initialize the Neon connection pool"""
+    load_dotenv()
+
+    connection_string = os.getenv('DATABASE_URL')
+
+    try:
+        global connection_pool
+        connection_pool = pool.SimpleConnectionPool(
+            1, 10, connection_string
+        )
+        if connection_pool:
+            print("Neon connection pool created successfully")
+    except Exception as e:
+        print(f"Could not connect to Neon DB: {e}")
+        connection_pool = None
+
+def upload_unsynced_events():
+    global db_conn
+    if not db_conn or not connection_pool:
+        return
+
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT id, timestamp, track_id, confidence, event_type, duration_seconds FROM events WHERE uploaded = 0")
+    rows = cursor.fetchall()
+
+    for row in rows:
+        event = {
+            'id': row[0],
+            'timestamp': row[1],
+            'track_id': row[2],
+            'confidence': row[3],
+            'event_type': row[4],
+            'duration_seconds': row[5]
+        }
+        success = push_event_to_neon(event)
+        if success:
+            cursor.execute("UPDATE events SET uploaded = 1 WHERE id = ?", (event['id'],))
+            db_conn.commit()
+            print(f"uploaded: {event['id'][:8]}...")
+        else:
+            print(f"upload failed: {event['id'][:8]}...")
+
+
+def close_neon_connection_pool() -> None:
+    """Close the Neon connection pool"""
+    if connection_pool:
+        connection_pool.closeall()
+        print("Neon connection pool closed")
+
 def init_database() -> None:
     """Initialize SQLite database and create events table"""
     global db_conn
@@ -78,7 +136,8 @@ def init_database() -> None:
             track_id INTEGER NOT NULL,
             confidence REAL NOT NULL,
             event_type TEXT NOT NULL,
-            duration_seconds REAL
+            duration_seconds REAL,
+            uploaded BOOLEAN DEFAULT 0
         )
     ''')
     
@@ -92,6 +151,29 @@ def close_database() -> None:
         db_conn.close()
         print("Database connection closed")
 
+def push_event_to_neon(event: dict) -> bool:
+    """Try pushing an event to the Neon database"""
+    global connection_pool
+    if not connection_pool:
+        return False
+    try:
+        conn = connection_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO events (id, timestamp, track_id, confidence, event_type, duration_seconds)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            event['id'], event['timestamp'], event['track_id'], event['confidence'],
+            event['event_type'], event['duration_seconds']
+        ))
+        conn.commit()
+        cur.close()
+        connection_pool.putconn(conn)
+        return True
+    except Exception as e:
+        print(f"❌ Neon push failed: {e}")
+        return False
+
 def save_event_snapshot(event_id: str, trigger_track_id: int) -> None:
     """Save a PNG snapshot of the visualization for an event"""
     global frame, tracks, line, counts, track_states
@@ -103,27 +185,35 @@ def save_event_snapshot(event_id: str, trigger_track_id: int) -> None:
     print(f"Saved event snapshot: {filename}")
 
 def log_event(track_id: int, confidence: float, event_type: EventType, duration_seconds: Optional[float] = None) -> None:
-    """Log an in/out event to the database and save visualization snapshot"""
     global db_conn
     if not db_conn:
         return
-    
+
     cursor = db_conn.cursor()
     timestamp = datetime.now().isoformat()
     event_id = cuid_generator()
     
+    # try to push to neon
+    event_data = {
+        'id': event_id,
+        'timestamp': timestamp,
+        'track_id': track_id,
+        'confidence': confidence,
+        'event_type': event_type,
+        'duration_seconds': duration_seconds
+    }
+    uploaded = push_event_to_neon(event_data)
+
+    # save to local db
     cursor.execute('''
-        INSERT INTO events (id, timestamp, track_id, confidence, event_type, duration_seconds)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (event_id, timestamp, track_id, confidence, event_type, duration_seconds))
-    
-    # Commit immediately to minimize data loss on crash
+        INSERT INTO events (id, timestamp, track_id, confidence, event_type, duration_seconds, uploaded)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (event_id, timestamp, track_id, confidence, event_type, duration_seconds, int(uploaded)))
     db_conn.commit()
-    duration_str = f", Duration: {duration_seconds:.1f}s" if duration_seconds is not None else ""
-    print(f"Logged {event_type} event: {event_id[:8]}... Track {track_id}, Confidence: {confidence:.3f}{duration_str}")
-    
-    # Save visualization snapshot
+
+    print(f"Logged {event_type} event {event_id[:8]}... (uploaded: {uploaded})")
     save_event_snapshot(event_id, track_id)
+
 
 def normalized_to_pixel(normalized_coords: NormalizedCoords, frame_width: int, frame_height: int) -> Tuple[int, int]:
     """Convert normalized coordinates (0-1) to pixel coordinates"""
@@ -223,7 +313,7 @@ def main() -> None:
     global track_states, counts, tracks, line, frame, results, left_is_in
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=str, default=None, help='Path to video file. If not set, webcam will be used.')
+    parser.add_argument('--input', type=str, choices=['picamera', 'video'], default=None, help='Path to video file or picamera. If not set, webcam will be used.')
     parser.add_argument('--in-side', type=str, choices=['left', 'right'], default='left',
                        help='Which side counts as "in" (default: left)')
     parser.add_argument('--show-viz', action='store_true', help='Show visualization window (default: False)')
@@ -236,15 +326,35 @@ def main() -> None:
         print("Visualization: Enabled")
     else:
         print("Visualization: Disabled (use --show-viz to enable)")
+    
 
     try:
-        cap = cv2.VideoCapture(0 if args.video is None else args.video)
+        #cap = cv2.VideoCapture(0 if args.video is None else args.video)
+        if args.input == 'picamera':
+            picam2 = Picamera2()
+            config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
+            picam2.configure(config)
+            picam2.start()
+        elif args.input == 'video':
+            cap = cv2.VideoCapture(args.video)
+        else:
+            cap = cv2.VideoCapture(0)
+
         model = YOLO('yolov8n.pt', verbose=False)  # Use YOLOv8 nano model for speed
+        frame_count = 0
+        MAX_FRAMES_TO_SAVE = 0
+        saved_frames = 0
+
 
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            if args.input == 'picamera':
+                frame = picam2.capture_array()
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             # Mirror the webcam horizontally
             frame = cv2.flip(frame, 1)
@@ -321,12 +431,17 @@ def main() -> None:
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        cap.release()
+        if args.input == 'picamera':
+            picam2.stop()  # stop picamera
         if args.show_viz:
             cv2.destroyAllWindows()
         close_database()
+        close_neon_connection_pool()
         print("Cleanup completed")
 
 if __name__ == '__main__':
     init_database()
+    init_neon_connection_pool()
+    upload_unsynced_events()
     main() 
+
