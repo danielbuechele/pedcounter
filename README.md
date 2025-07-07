@@ -32,12 +32,12 @@ pip3 install -r requirements.txt
 
 ### With Webcam
 ```bash
-python main.py
+python3 main.py
 ```
 
 ### With Video File
 ```bash
-python main.py --video path_to_video.mp4
+python3 main.py
 ```
 
 Press `q` to quit the visualization window.
